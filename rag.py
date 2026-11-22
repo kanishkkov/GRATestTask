@@ -2,10 +2,18 @@
 from pathlib import Path
 import faiss
 import pymupdf  # PyMuPDF
+import re
+import requests
 from sentence_transformers import SentenceTransformer
 
 
 MODEL_NAME = "all-MiniLM-L6-v2"
+OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MIN_RELEVANCE_SCORE = 0.6
+INSUFFICIENT_ANSWER = (
+    "The supplied documents do not contain sufficient information to answer this question."
+)
 # Covers, letters, contents, promotional/contact pages, blank notes, and back covers.
 EXCLUDED_PAGES = {
     "llc.pdf": {1, 2, 3, 4, 18, 20},
@@ -112,6 +120,128 @@ def retrieve(question, k=6):
     return results
 
 
+def generate_answer(question):
+    """Answer a question using retrieved context and a local Ollama model."""
+    results = retrieve(question)
+
+    # Tuned only to this prototype's small test set. This is not a calibrated
+    # answerability score: valid questions may score lower, and a high score does not
+    # guarantee that the retrieved passages answer the question.
+    if not results or results[0]["score"] < MIN_RELEVANCE_SCORE:
+        return INSUFFICIENT_ANSWER
+
+    chunk_order = {
+        (chunk["source"], chunk["page"], chunk["text"]): position
+        for position, chunk in enumerate(indexed_chunks)
+    }
+    page_groups = {}
+    for rank, result in enumerate(results, start=1):
+        key = (result["source"], result["page"])
+        group = page_groups.setdefault(key, {"rank": rank, "texts": []})
+        group["texts"].append(result["text"])
+
+    context_sections = []
+    for (source, page), group in page_groups.items():
+        texts = sorted(
+            group["texts"],
+            key=lambda text: chunk_order[(source, page, text)],
+        )
+        merged_text = texts[0]
+        for text in texts[1:]:
+            if merged_text.endswith(text[:150]):
+                merged_text += text[150:]
+            else:
+                merged_text += f"\n{text}"
+
+        context_sections.append(
+            f"[Rank: {group['rank']} | Source: {source} | Page: {page} | "
+            f"Citation: ({source}, page {page})]\n{merged_text}"
+        )
+
+    context = "\n\n".join(context_sections)
+
+    system_prompt = """You are the Buckeye Startup Coach.
+Use only the supplied context and answer the specific question without tangential facts.
+Preserve conditional language such as "if applicable" and "may"; never turn optional
+information into a requirement. Distinguish initial requirements and fees from later
+changes, updates, or penalties. Cite each factual sentence inline as (filename, page N).
+When answering questions about mandatory legal formation or registration requirements,
+use passages that explicitly describe required filings or mandatory information. Do not
+present general startup checklists, recommendations, optional provisions, or subsequent
+operating obligations as mandatory formation requirements.
+If the context is insufficient, respond exactly with: """ + INSUFFICIENT_ANSWER + """
+Keep the answer concise and practical."""
+
+    user_prompt = f"""Retrieved document context:
+
+{context}
+
+Question: {question}
+
+Answer only from the context above, with inline source citations."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    allowed_citations = {
+        (result["source"], str(result["page"])) for result in results
+    }
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=60,
+        )
+    except requests.ConnectionError:
+        return "Error: Could not connect to Ollama. Start it and try again."
+    except requests.Timeout:
+        return "Error: Ollama did not respond within 60 seconds."
+    except requests.RequestException as error:
+        return f"Error communicating with Ollama: {error}"
+
+    if not response.ok:
+        try:
+            message = response.json().get("error", response.text)
+        except ValueError:
+            message = response.text
+        return f"Ollama error: {message}"
+
+    try:
+        answer = response.json()["message"]["content"].strip()
+    except (KeyError, TypeError, ValueError):
+        return "Error: Ollama returned an unexpected response."
+
+    if answer.startswith(INSUFFICIENT_ANSWER):
+        return INSUFFICIENT_ANSWER
+
+    citations = set(re.findall(r"\(([^,()]+), page (\d+)\)", answer))
+    valid_citations = citations and citations.issubset(allowed_citations)
+    list_items = [
+        line.strip() for line in answer.splitlines()
+        if line.strip().startswith(("- ", "* "))
+        or re.match(r"\d+[.)]\s", line.strip())
+    ]
+    list_items_are_cited = not list_items or all(
+        re.search(r"\([^,()]+, page \d+\)\s*$", line)
+        for line in list_items
+    )
+    if valid_citations and list_items_are_cited:
+        return answer
+
+    return (
+        f"{answer}\n\n"
+        "[Warning: Citation coverage validation failed. One or more claims or list "
+        "items lack a valid retrieved source/page citation.]"
+    )
+
+
 if __name__ == "__main__":
     pages = load_documents()
     chunks = chunk_documents(pages)
@@ -122,18 +252,18 @@ if __name__ == "__main__":
     build_index(chunks)
     print(f"Indexed {len(indexed_chunks)} chunks after removing boilerplate")
 
-    questions = [
-        "What are the requirements for starting an LLC in Ohio?",
-        "How much does it cost to file Articles of Organization in Ohio?",
-        "Does a sole proprietorship need to register with the Ohio Secretary of State?",
-        "What is a statutory agent for an Ohio LLC?",
-    ]
+    print("\nAsk a question, or type 'exit' to quit.")
+    while True:
+        try:
+            question = input("\nQuestion: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
 
-    for question in questions:
-        print(f"\nQuestion: {question}")
-        for rank, result in enumerate(retrieve(question), start=1):
-            print(
-                f"\n{rank}. {result['source']}, page {result['page']} "
-                f"(similarity: {result['score']:.3f})"
-            )
-            print(result["text"])
+        if question.lower() == "exit":
+            print("Goodbye!")
+            break
+        if not question:
+            continue
+
+        print(f"\n{generate_answer(question)}")
